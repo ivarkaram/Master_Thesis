@@ -1,0 +1,326 @@
+---
+title: "ovarian carcinosarcoma"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## R Markdown
+
+ 
+```{r}
+library(STutility)
+library(gprofiler2)
+library(msigdbr)
+library(GSA)
+library(corrplot)
+library(dplyr)
+```
+
+
+Create infotable
+```{r}
+infoTable <- data.frame(samples = c("/Users/ivarkaram/Downloads/Archive/V19T26-103_A1/filtered_feature_bc_matrix.h5", "/Users/ivarkaram/Downloads/Archive/V19T26-103_B1/filtered_feature_bc_matrix.h5", "/Users/ivarkaram/Downloads/Archive/V19T26-103_C1/filtered_feature_bc_matrix.h5", "/Users/ivarkaram/Downloads/Archive/V19T26-103_D1/filtered_feature_bc_matrix.h5"),
+                        spotfiles = c("/Users/ivarkaram/Downloads/Archive/V19T26-103_A1/spatial/tissue_positions_list.csv", "/Users/ivarkaram/Downloads/Archive/V19T26-103_B1/spatial/tissue_positions_list.csv", "/Users/ivarkaram/Downloads/Archive/V19T26-103_C1/spatial/tissue_positions_list.csv", "/Users/ivarkaram/Downloads/Archive/V19T26-103_D1/spatial/tissue_positions_list.csv"),
+                        imgs = c("/Users/ivarkaram/Downloads/Archive/V19T26-103_A1/spatial/tissue_hires_image.png", "/Users/ivarkaram/Downloads/Archive/V19T26-103_B1/spatial/tissue_hires_image.png",
+                                 "/Users/ivarkaram/Downloads/Archive/V19T26-103_C1/spatial/tissue_hires_image.png",
+                                 "/Users/ivarkaram/Downloads/Archive/V19T26-103_D1/spatial/tissue_hires_image.png"),
+                        json = c("/Users/ivarkaram/Downloads/Archive/V19T26-103_A1/spatial/scalefactors_json.json",
+                                 "/Users/ivarkaram/Downloads/Archive/V19T26-103_B1/spatial/scalefactors_json.json", "/Users/ivarkaram/Downloads/Archive/V19T26-103_C1/spatial/scalefactors_json.json", "/Users/ivarkaram/Downloads/Archive/V19T26-103_D1/spatial/scalefactors_json.json"), 
+                        section.name = c("A1", "B1", "C1", "D1"),
+                        stringsAsFactors = FALSE)
+```
+
+Create seurat object
+```{r}
+se <- InputFromTable(infotable = infoTable, 
+                      platform =  "Visium")
+se
+```
+
+## Quality control
+Start with plotting the raw counts.
+
+Clear linear relationship between the number of unique genes as a function of the number of RNA molecules. This is also motivation to perform normalization
+```{r}
+FeatureScatter(se, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "section.name")
+```
+
+By using the ST.FeaturePlot function we can start exploring how much RNA was captured in the tissue and the unique number of RNA in the tissue for all of the spots across every slide. Let's visualize that.
+```{r}
+ST.FeaturePlot(se, features = c('nCount_RNA', 'nFeature_RNA'), dark.theme = F, cols = c("lightgray", "mistyrose", "red", "dark red", "black"), ncol = 2)
+```
+
+Filtering could have been applied when creating the seurat object above by passing in all or any of the following parameters:  
+-->min.gene.count, which removes all genes in the tissue below a certain threshold.
+-->min.gene.spots, which sets a threshold of a minimum number of spots where genes are detected in.
+-->min.spot.feature.count, which sets a threshold of the least number of unique genes in a spot.
+-->min.spot.count, which sets a threshold of the least number of counts in a spot.
+-->topN, which only retains the n most expressed genes in the tissue.
+
+However, it would be very naive to filter the data without exploring it more in depth to understand the actual distribution of some of these parameters in the data.
+
+It would be interesting to explore the number of unique genes/spot and total number of counts/spot in our tissue. 
+```{r}
+p1 <- ggplot(data = se[[]], aes(nFeature_RNA)) +
+  geom_histogram(aes(fill=..count..), color='black', bins = 50, alpha=0.9) + 
+  ggtitle("Unique genes per spot") 
+p2 <- ggplot(data = se[[]], aes(nCount_RNA)) +
+  geom_histogram(aes(fill=..count..), color='black', bins = 50, alpha=0.9) + 
+  ggtitle("Total counts per spots")
+p1
+p2
+```
+
+We can also visualize the distribution with violin-plots.
+```{r}
+VlnPlot(se, features = c("nFeature_RNA", "nCount_RNA"), group.by = "section.name")
+```
+
+We can see in the first histogram representing the unique genes/spot that we seem to have a number of spots with very few unique genes. We can plot a vertical line to understand how many unique genes there are in these spots.
+```{r}
+p1 + geom_vline(xintercept = 180, linetype='dashed')
+```
+
+## Quality control of mitochondrial/Ribosomal genes
+Want to look for variation in these and outliers and ultimately decide whether they should be kept or not as they would affect downstream analysis somewhat
+
+```{r}
+mt.genes <- grep(pattern = "^MT-", x = rownames(se), value = TRUE)
+se$percent.mito <- (Matrix::colSums(se@assays$RNA@counts[mt.genes, ])/Matrix::colSums(se@assays$RNA@counts))*100
+
+# Collect all genes coding for ribosomal proteins
+rp.genes <- grep(pattern = "^RPL|^RPS", x = rownames(se), value = TRUE)
+se$percent.ribo <- (Matrix::colSums(se@assays$RNA@counts[rp.genes, ])/Matrix::colSums(se@assays$RNA@counts))*100
+
+```
+
+
+```{r}
+FeatureScatter(se, feature1 = "nFeature_RNA", feature2 = "percent.mito", group.by = "section.name")
+```
+
+```{r}
+FeatureScatter(se, feature1 = "nFeature_RNA", feature2 = "percent.ribo", group.by = "section.name")
+```
+
+```{r}
+VlnPlot(object = se, features = "percent.mito", group.by = "section.name") + NoLegend()
+VlnPlot(object = se, features = "percent.ribo", group.by = "section.name") + NoLegend()
+```
+
+
+
+## Filtering
+
+Based on quality check it could be a good idea to remove spots with less than 180 unique genes. 
+In addition, to remove the effect of downstream analysis both mitochondrial and ribosomal genes are removed from the meta data.
+```{r}
+se.subset <- SubsetSTData(se, expression = nFeature_RNA > 180) 
+
+genes <- rownames(se)
+keep.genes <- genes[!(grepl("^(MT-|RPL|RPS)",genes))]
+
+se.subset <- SubsetSTData(object = se.subset, features = keep.genes)
+
+cat("Spots removed: ", ncol(se) - ncol(se.subset))
+cat("\n")
+cat("Genes removed: ", nrow(se) - nrow(se.subset))
+```
+
+## Image handling
+
+
+```{r}
+se.subset <- LoadImages(se.subset, time.resolve = F, verbose = T, xdim = 2000)
+```
+
+```{r}
+se.subset <- MaskImages(object = se.subset)
+```
+
+
+```{r}
+ImagePlot(se.subset, ncols = 2, method = "raster", type = "raw", darken = F)
+```
+
+
+
+## Normalization
+
+Why? To remove technical effects (linear relationship), for example compare the distribution of a gene across a tissue (scaled vs raw counts) would be wrong as it will not take into account the sequencing depth
+```{r, warning=FALSE, message=FALSE}
+se.subset <- SCTransform(se.subset, verbose = FALSE)
+```
+
+Explore the the distribution of the 2 main principal components using violin plots for each of the sections to investigate whether we would need to regress out the sections to make them more comparable.
+```{r}
+se.subset <- RunPCA(se.subset, verbose = FALSE)
+VlnPlot(se.subset, features = "PC_1", group.by = "section.name") +NoLegend()
+VlnPlot(se.subset, features = "PC_2", group.by = "section.name")+NoLegend()
+```
+
+
+## Factorization
+
+The choice of numbers of factors are quite arbitary. However, it is good to consider the library complexity and manually check whether the driver genes makes sense.
+```{r}
+se.subset_5 <- RunNMF(se.subset, nfactors = 10)
+```
+
+Check correlation of factors to see if there are any relationship between them
+
+```{r}
+cor.data_5 <- cor(se.subset_5[["NMF"]]@feature.loadings, method = "pearson")
+
+cscale <- colorRampPalette(c("white", "lightblue", "darkred"))
+
+corrplot(cor.data_5,method="color", cl.lim = c(0,1), col = cscale(200))
+```
+
+
+Check driver genes of each factor
+
+```{r}
+len_factor <- length(se.subset_5[["NMF"]])
+for (i in (1:len_factor)){
+plt<-FactorGeneLoadingPlot(se.subset_5, factor = i, topn = 10, dark.theme = F) + theme(axis.text.y = element_text(face="bold", color="#993333", size=14),
+  axis.text.x = element_text(face="bold", color="#993333", size=14), axis.title = element_blank())
+print(plt)
+}
+```
+
+Plot the spatial distribution of the 10 factors
+
+```{r}
+n_nmf <- length(se.subset_5[['NMF']])
+for (i in 1:n_nmf){
+  print(ST.DimPlot(se.subset_5, 
+           dims = i,
+           ncol = 2, # Sets the number of columns at dimensions level
+           grid.ncol = 1, # Sets the number of columns at sample level
+           reduction = "NMF", 
+           dark.theme = F, 
+           pt.size = 1, 
+           center.zero = F, 
+           palette="Spectral",
+           show.sb = FALSE) + ggtitle(" "))
+}
+```
+
+
+
+## Pathway analysis pre-processing
+
+Make a function, "genes_factor", which takes a seurat object and number as input, and returns the gene names of the top n number of driver genes from each of the factors.
+```{r}
+genes_factor <- function(seurat.object, n){
+  factor <- c()
+  for (i in 1:length(seurat.object[['NMF']])){
+  factor_n <- names(sort((seurat.object[["NMF"]]@feature.loadings[,i]), decreasing = TRUE)[1:n])
+  gene_list <- list(factor_n)
+  factor <- c(factor, gene_list)
+  }
+  return(factor)
+}
+```
+
+Select 20 top driver genes from each factor
+```{r}
+factor <- genes_factor(se.subset_5, 20)
+factor[[1]]
+```
+
+
+##Pathway analysis
+We continue with pathway analysis which is a great tool for understanding and annotating the  functions of our genes in a broader context.
+
+Here gprofiler2 will be used to perform over representation analysis with GO:BP, hallmarks and  
+
+
+## GO:Biological processes
+One issue with ORA is the fact that all genes are ranked the same when performing pathway enrichment. To circumvent this issue somewhat the argument ordered_query is set to TRUE. Thus each gene will be added iteratively, before pathway enrichment will be performed for that list of gene. The most significantly enriched will be stored.
+
+```{r, fig.width=7, fig.height=6}
+len_factor <- length(se.subset_5[["NMF"]])
+for (i in 1:len_factor){
+  enrichment <- gost(query = factor[[i]], ordered_query = TRUE, organism = 'hsapiens', correction_method = 'fdr', user_threshold = 0.01, multi_query = TRUE) 
+plt <- gostplot(enrichment, capped = FALSE, interactive = TRUE)
+print(plt)
+}
+```
+
+Problem, for almost all pathways we get a massive output that is hard to summarize. We need to simplify this a bit. 
+
+Redo pathway analysis but only enrich for GO:BP and keep the top 3 enriched terms.
+
+
+```{r}
+df <- data.frame()
+for (i in 1:len_factor){
+  enrichment <- gost(query = factor[[i]], ordered_query = TRUE, organism = 'hsapiens', correction_method = 'fdr', user_threshold = 0.01, source="GO:BP") 
+  enrichment$result <- mutate(enrichment$result, factor = i) # add the factor as column value
+df <- rbind(df, enrichment$result[,c("term_name", "p_value", "factor")][1:3,])
+}
+log10_pvalue <- -log10(unlist(df$p_value))
+df <- cbind(df, log10_pvalue)
+df$term_name <- toupper(df$term_name)
+```
+
+
+## Cancer hallmarks
+
+Can also perform enrichment for hallmarks of cancer. Upload a downloaded gmt file to ggprofiler
+
+```{r, eval = FALSE}
+gprofiler2::upload_GMT_file(gmtfile ="/Users/ivarkaram/Downloads/h.all.v7.2.symbols.gmt" ) # enter filepath
+```
+
+
+Perform pathway enrichment, print the need to check which are annotated to the hallmarks
+```{r}
+for (i in 1:len_factor){
+  print(i)
+enrichment.cancer <- gost(query = factor[[i]], ordered_query = TRUE, correction_method = 'fdr', user_threshold = 0.01, organism = "gp__090C_YOUN_19Y")
+}
+```
+
+Only enrich with annotated factors. Store the result in a common data frame
+```{r}
+hallmarks <- c(2:9)
+hallmark_df <- data.frame() # make an empty dataframe
+for (i in hallmarks){
+  enrichment.cancer <- gost(query = factor[[i]], ordered_query = TRUE, correction_method = 'fdr', user_threshold = 0.01, organism = "gp__090C_YOUN_19Y")
+enrichment.cancer$result <- mutate(enrichment.cancer$result, factor = i) 
+hallmark_df <- rbind(hallmark_df, enrichment.cancer$result[, c("p_value", "term_id","factor")])
+}
+log10_pvalue <- -log10(hallmark_df$p_value)
+hallmark_df <- cbind(hallmark_df, log10_pvalue)
+hallmark_df$term_id <- gsub(pattern = "_", replacement = " ", x = hallmark_df$term_id)
+hallmark_df <- hallmark_df %>% rename(term_name = term_id)
+```
+
+
+Bind the two dataframes before plotting
+```{r}
+combined_df <- dplyr::bind_rows(hallmark_df, df)
+```
+
+
+Visualize
+```{r, fig.width=18, fig.height=10}
+plt <- ggplot(combined_df, aes(x = factor, y = term_name)) +
+        geom_point(aes(color=term_name,size=log10_pvalue)) +
+  scale_x_continuous(limits = c(1,10), breaks = c(0:10))+
+        theme_classic()+
+  theme(legend.position="right", axis.text  = element_text(size=12), axis.title.x = element_text(size=12), axis.title.y = element_blank(), legend.text = element_text(size=12),
+        legend.title = element_text(size = 12)) +
+  xlab(label = "Factors")+
+  guides(color = FALSE, size=guide_legend("-log10 (FDR p-value)"))
+plt
+```
+
+
