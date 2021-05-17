@@ -1,0 +1,884 @@
+---
+title: "Spatial transcriptomics analysis of triple negative breast cancer"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+```{r}
+library(STutility)
+library(corrplot)
+library(dplyr)
+library(pheatmap)
+library(readr)
+```
+
+
+## Loading data
+```{r}
+data = '/home/ivar.karam/presentation/data'
+images = '/home/ivar.karam/presentation/images'
+spots = '/home/ivar.karam/presentation/spots'
+```
+
+
+```{r}
+samples <- list.files(path = file.path(data), pattern = 'tsv', full.names = T, recursive = T)
+imgs <- list.files(path = file.path(images), pattern = '.jpg', full.names = T, recursive = T)
+spotfiles <- list.files(path = file.path(spots), pattern = 'spots.tsv', full.names = T)
+```
+
+Make a data frame consisting of the sample data and meta data
+```{r}
+info_table <- data.frame(samples, imgs, spotfiles, stringsAsFactors = F,region = c("A1" ,"A2", "B1" ,"B2", "C1", "C2", "D1", "D2", "E1", "E2", "F1", "F2"), patient = c("A","A", "B", "B","C", "C","D", "D","E", "E","F", "F"))
+```
+
+Read in annotation file to convert ENSEMBL ids to gene symbols when reading in seurat object
+
+```{r}
+ensids <- read.table("/home/ivar.karam/TNBC_new/TNBC_2/genes.tsv", header = T, sep = "\t", stringsAsFactors = F)
+```
+
+
+## Creating seurat object
+
+```{r, message=FALSE}
+se<- InputFromTable(infotable = info_table,
+                      annotation = ensids,
+                      platform = "2k",
+                      transpose = T)
+```
+## Quality control
+Plot distribution of nfeatures and ncounts
+```{r, echo=FALSE}
+p1 <- ggplot(data = se[[]], aes(nCount_RNA))+
+                geom_histogram(aes(fill=..count..), color="black", bins=60, alpha=0.9) +
+  ggtitle("Total counts per spots")
+
+p2 <- ggplot(data = se[[]], aes(nFeature_RNA)) +
+  geom_histogram(aes(fill=..count..), color='black', bins = 60, alpha=0.9) + 
+  ggtitle("Unique genes per spot") 
+
+p1
+p2
+```
+
+Set a threshold
+```{r}
+p2 + geom_vline(xintercept = 400, linetype="dashed")
+```
+
+
+Look at distribution of unique genes/spot and counts/spot for each patient
+```{r}
+VlnPlot(object = se, features = c("nFeature_RNA", "nCount_RNA"), group.by = "patient") +NoLegend()
+```
+
+Further explore the spatial distribution of the unique genes/spot
+```{r}
+ST.FeaturePlot(se, features = "nFeature_RNA", dark.theme = TRUE, cols = c("dark blue", "cyan", "yellow", "red", "dark red"), ncol = 3)
+```
+
+Quality control of mitochondrial/Ribosomal genes
+Want to look for variation in these and outliers and ultimately decide whether they should be kept or not as they would affect downstream analysis somewhat
+
+```{r}
+mt.genes <- grep(pattern = "^MT-", x = rownames(se), value = TRUE)
+se$percent.mito <- (Matrix::colSums(se@assays$RNA@counts[mt.genes, ])/Matrix::colSums(se@assays$RNA@counts))*100
+
+# Collect all genes coding for ribosomal proteins
+rp.genes <- grep(pattern = "^RPL|^RPS", x = rownames(se), value = TRUE)
+se$percent.ribo <- (Matrix::colSums(se@assays$RNA@counts[rp.genes, ])/Matrix::colSums(se@assays$RNA@counts))*100
+VlnPlot(object = se, features = "percent.mito", group.by = "patient") + NoLegend()
+VlnPlot(object = se, features = "percent.ribo", group.by = "patient") + NoLegend()
+```
+
+
+## Filter out genes and bad spots
+
+```{r}
+se.subset <- SubsetSTData(se, expression = nFeature_RNA > 400)
+
+genes <- rownames(se)
+keep.genes <- genes[!(grepl("^(MT-|RPL|RPS|MRPL)",genes))]
+
+se.subset <- SubsetSTData(object = se.subset, features = keep.genes)
+
+cat("Spots removed: ", ncol(se) - ncol(se.subset), "\n")
+cat("Genes removed: ", nrow(se) - nrow(se.subset))
+```
+
+
+## Image handling
+Upload the images
+```{r}
+se.subset <- LoadImages(se.subset, time.resolve = F, verbose = T)
+```
+
+
+## Split the patients
+
+```{r}
+se_split <- lapply(unique(se.subset$patient), function(p) {
+  SubsetSTData(se.subset, expression = patient %in% p)
+})
+
+for (i in 1: length(se_split)){
+  ImagePlot(se_split[[i]], ncols = 1, method = "raster", type = "raw")
+}
+```
+
+
+## Normalization
+Normalize each individual patient
+```{r, message=FALSE, warning=FALSE}
+for (i in 1:length(se_split)){
+  se_split[[i]]<- SCTransform(se_split[[i]], verbose = FALSE, variable.features.rv.th = 1.1, variable.features.n = NULL, return.only.var.genes = FALSE)
+}
+```
+
+
+
+## Combine the patients
+It could be interesting to look at how the patients compare based on a bulk PCA run. Therefore, we merge al the seurat objects to one, normalize the merged object and deconvolve with PCA
+```{r, message=FALSE}
+merged_ST <- merge(se_split[[1]], y = c(se_split[2:6]),merge.data = TRUE)
+# Normalize
+merged_ST <- SCTransform(object = merged_ST, verbose = FALSE, variable.features.rv.th = 1.1, variable.features.n = NULL, return.only.var.genes = FALSE)
+
+merged_ST <- RunPCA(merged_ST)
+
+merged_ST <- RunUMAP(merged_ST, dims = 1:30)
+
+DimPlot(merged_ST, group.by = "region", label = T)  + NoAxes() + ggtitle("Spots embedded in UMAP") + NoLegend()
+```
+
+## Spatial patterns
+Find spatial patterns of the data with NMF
+```{r, message=FALSE}
+se_split[[1]] <- RunNMF(se_split[[1]], nfactors = 10)
+
+se_split[[2]] <- RunNMF(se_split[[2]], nfactors = 10)
+
+se_split[[3]] <- RunNMF(se_split[[3]], nfactors = 10)
+
+se_split[[4]] <- RunNMF(se_split[[4]], nfactors = 10)
+
+se_split[[5]] <- RunNMF(se_split[[5]], nfactors = 10)
+se_split[[6]] <- RunNMF(se_split[[6]], nfactors = 10)
+```
+
+
+
+Look at the driver genes and the distribution of the patterns
+
+```{r}
+driver_genes <- function (se_object){
+  len_factor <- length(se_object[["NMF"]])
+for (i in (1:len_factor)){
+print(FactorGeneLoadingPlot(se_object, factor = i, topn = 10, dark.theme = TRUE))
+}
+}
+spatial_distributions <- function(se_object){
+  cscale <- c("darkblue", "cyan", "yellow", "red", "darkred")
+plt<- ST.DimPlot(se_object, 
+           dims = 1:10,
+           ncol = 3, # Sets the number of columns at dimensions level
+           grid.ncol = 3, # Sets the number of columns at sample level
+           reduction = "NMF", 
+           dark.theme = T, 
+           pt.size = 1, 
+           center.zero = F, 
+           cols = cscale)
+return (plt)
+}
+```
+
+
+
+Patient 1
+
+```{r}
+driver_genes(se_split[[1]])
+spatial_distributions(se_split[[1]])
+```
+
+Patient 2
+```{r}
+driver_genes(se_split[[1]])
+spatial_distributions(se_split[[1]])
+```
+
+Patient 3
+```{r}
+driver_genes(se_split[[1]])
+spatial_distributions(se_split[[1]])
+```
+
+
+Patient 4
+```{r}
+driver_genes(se_split[[1]])
+spatial_distributions(se_split[[1]])
+```
+
+Patient 5
+```{r}
+driver_genes(se_split[[1]])
+spatial_distributions(se_split[[1]])
+```
+
+Patient 6
+```{r}
+driver_genes(se_split[[1]])
+spatial_distributions(se_split[[1]])
+```
+
+
+## Single cell interogation
+
+Read the files
+```{r}
+library(readr)
+# Read in `matrix.mtx`
+counts <- Matrix::readMM("/home/ivar.karam/TNBC_new/TNBC_2/sc_data/counts_matrix/matrix.mtx.gz")
+
+# Read in `genes.tsv`
+genes <- readr::read_tsv("/home/ivar.karam/TNBC_new/TNBC_2/sc_data/counts_matrix/features.tsv.gz", col_names = FALSE)
+gene_ids <- genes$X1
+
+# Read in `barcodes.tsv`
+cell_ids <- read_tsv("/home/ivar.karam/TNBC_new/TNBC_2/sc_data/counts_matrix/barcodes.tsv.gz", col_names = FALSE)$X1
+```
+
+
+Make the column names as the cell IDs and the row names as the gene IDs
+```{r}
+rownames(counts) <- gene_ids
+colnames(counts) <- cell_ids
+```
+
+Read in the metadata
+```{r}
+metadata <- read.table("/home/ivar.karam/TNBC_new/TNBC_2/sc_data/Wu_EMBO_metadata.csv", sep = ",", header = TRUE, stringsAsFactors = FALSE, row.names = 1)
+
+metadata$percent.mito <- as.numeric(metadata$percent.mito)
+metadata$nFeature_RNA <- as.numeric(metadata$nFeature_RNA)
+metadata$nCount_RNA <- as.numeric(metadata$nCount_RNA)
+sapply(metadata, class)
+```
+
+Remove the first row
+```{r}
+metadata<- metadata[2:24272,]
+```
+
+Check that rownames of meta data matches colnames of gene expression data
+```{r}
+check <- all(rownames(metadata) == colnames(counts))
+check
+```
+
+Create a seurat object
+```{r}
+sc_se <- CreateSeuratObject(counts = counts, meta.data = metadata)
+```
+
+## Filter single cell data
+
+First thing to remove mitochondrial genes and ribosomal genes.
+```{r}
+genes <- rownames(sc_se)
+keep.genes <- genes[!(grepl("^(MT-|RPL|RPS|MRPL)",genes))]
+
+sc_se.subset <- subset(sc_se, features = keep.genes)
+
+cat("Genes removed are: ", nrow(sc_se) - nrow(sc_se.subset))
+```
+
+Secondly, remove bad cells
+```{r}
+keep.cells <- sc_se$nFeature_RNA >250
+keep.cells <- which(keep.cells)
+sc_se.subset <- subset(sc_se.subset, cells = keep.cells)
+cat("Cells removed: ", ncol(sc_se) - ncol(sc_se.subset))
+```
+
+## Normalize single cell data
+
+```{r, warning=FALSE, message=FALSE}
+sc_se.subset <- SCTransform(sc_se.subset, verbose = FALSE, variable.features.rv.th = 1.1, variable.features.n = NULL, return.only.var.genes = FALSE)
+```
+
+## Dimensionalitty reduction
+```{r}
+sc_se.subset <- RunPCA(object = sc_se.subset, verbose = FALSE)
+sc_se.subset <- RunUMAP(object = sc_se.subset, verbose = FALSE, dims = 1:30)
+```
+
+```{r, fig.width=8, fig.height=6}
+DimPlot(sc_se.subset, group.by = "celltype_final", label = T) +NoAxes() + NoLegend()+ ggtitle("Single cells embedded in UMAP") 
+```
+
+```{r, fig.width=9, fig.height=6}
+DimPlot(sc_se.subset, group.by = "celltype_final", label = F) +NoAxes() + ggtitle("Single cells embedded in UMAP")
+```
+
+
+## Map single cells with ST data
+```{r, message=FALSE}
+for (i in 1:length(se_split)){
+anchors <- FindTransferAnchors(reference = sc_se.subset, query = se_split[[i]], normalization.method = "SCT",verbose = FALSE)
+predictions.assay <- TransferData(anchorset = anchors, refdata = sc_se.subset$celltype_final, prediction.assay = TRUE, weight.reduction = se_split[[i]][["NMF"]], dims = 1:10, verbose = FALSE)
+se_split[[i]][["predictions"]] <- predictions.assay
+DefaultAssay(se_split[[i]]) <- "predictions"
+}
+```
+
+
+Single cell predictions Patient 1
+```{r, fig.width=9, fig.height=9}
+celltypes <- rownames(se_split[[1]][1:20])
+  col_scale = c("dark blue", "cyan", "yellow", "red", "dark red")
+ST.FeaturePlot(object = se_split[[1]], features = c(celltypes), ncol = 4, grid.ncol = 4, cols = col_scale, show.sb = F)
+```
+
+Single cell predictions Patient 2
+```{r, fig.width=9, fig.height=9}
+ST.FeaturePlot(object = se_split[[2]], features = c(celltypes), ncol = 4, grid.ncol = 4, cols = col_scale, show.sb = F)
+```
+
+Single cell predictions Patient 3
+```{r, fig.width=9, fig.height=9}
+ST.FeaturePlot(object = se_split[[3]], features = c(celltypes), ncol = 4, grid.ncol = 4, cols = col_scale, show.sb = F)
+```
+
+Single cell predictions Patient 4
+```{r, fig.width=9, fig.height=9}
+ST.FeaturePlot(object = se_split[[4]], features = c(celltypes), ncol = 4, grid.ncol = 4, cols = col_scale, show.sb = F)
+```
+
+Single cell predictions Patient 5
+```{r, fig.width=9, fig.height=9}
+ST.FeaturePlot(object = se_split[[5]], features = c(celltypes), ncol = 4, grid.ncol = 4, cols = col_scale, show.sb = F)
+```
+
+Single cell predictions Patient 6
+```{r, fig.width=9, fig.height=9}
+ST.FeaturePlot(object = se_split[[6]], features = c(celltypes), ncol = 4, grid.ncol = 4, cols = col_scale, show.sb = F)
+```
+
+## Correlation between the cells
+```{r}
+cscale <- colorRampPalette(c("darkblue", "white", "darkred"))
+for (i in 1: length(se_split)){
+data_patient <- GetAssayData(object = se_split[[i]][1:20])
+a<-apply(data_patient, 1, function(row) all(row == 0))
+values<-which(!a)
+patient_values<-data_patient[values,]
+patient_cor <- cor(t(patient_values), method='pearson')
+corrplot(patient_cor,method="color", col = cscale(200))
+}
+```
+
+Change the assay back to SCT
+
+```{r}
+for (i in 1:length(se_split)){
+  DefaultAssay(se_split[[i]]) <- "SCT"
+}
+```
+
+## Clustering
+
+Start with finding neighbors based on the already computed NMF dimensionality reduction
+```{r, message=FALSE}
+se_split[[1]] <- FindNeighbors(object = se_split[[1]], reduction = "NMF", dims = 1:10)
+se_split[[2]] <- FindNeighbors(object = se_split[[2]], reduction = "NMF", dims = 1:10)
+se_split[[3]] <- FindNeighbors(object = se_split[[3]], reduction = "NMF", dims = 1:10)
+se_split[[4]] <- FindNeighbors(object = se_split[[4]], reduction = "NMF", dims = 1:10)
+se_split[[5]] <- FindNeighbors(object = se_split[[5]], reduction = "NMF", dims = 1:10)
+se_split[[6]] <- FindNeighbors(object = se_split[[6]], reduction = "NMF", dims = 1:10)
+```
+
+
+Find clusters
+```{r, message=FALSE}
+se_split[[1]] <- FindClusters(object = se_split[[1]],  verbose = FALSE, resolution = 0.3)
+se_split[[2]] <- FindClusters(object = se_split[[2]],  verbose = FALSE, resolution = 0.3)
+se_split[[3]] <- FindClusters(object = se_split[[3]],  verbose = FALSE, resolution = 0.3)
+se_split[[4]] <- FindClusters(object = se_split[[4]],  verbose = FALSE, resolution = 0.3)
+se_split[[5]] <- FindClusters(object = se_split[[5]],  verbose = FALSE, resolution = 0.3)
+se_split[[6]] <- FindClusters(object = se_split[[6]],  verbose = FALSE, resolution = 0.3)
+```
+
+Spatially look at all cluster
+
+```{r}
+library(RColorBrewer)
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+for (i in 1:length(se_split)){
+ print(ST.FeaturePlot(object = se_split[[i]], features = "seurat_clusters", dark.theme = F, pt.size = 1.5, ncol = 1, show.sb = FALSE, cols = col_vector[c(1:3, 5:7,24,35)]) +ggtitle("")) 
+}
+```
+
+
+
+Look at individual clusters
+```{r}
+for (i in 1:length(se_split)){
+  print(ST.FeaturePlot(object = se_split[[i]], features = "seurat_clusters", pt.size = 1, split.labels = T, indices = 1, show.sb = FALSE, ncol = 3))
+  print(ST.FeaturePlot(object = se_split[[i]], features = "seurat_clusters", pt.size = 1, split.labels = T, indices = 2, show.sb = FALSE, ncol = 3))
+}
+```
+
+
+## Differential Gene Expression
+Set a threshold of 0.5 average log2 fold change and a p-adjusted value below 0.01
+```{r}
+markers1 <- FindAllMarkers(object = se_split[[1]], logfc.threshold = 0.5, return.thresh = 0.01, 
+                           only.pos = T, verbose = F)
+
+markers2 <- FindAllMarkers(object = se_split[[2]], logfc.threshold = 0.5, return.thresh = 0.01, 
+                           only.pos = T, verbose = F)
+markers3 <- FindAllMarkers(object = se_split[[3]], logfc.threshold = 0.5, return.thresh = 0.01, 
+                           only.pos = T, verbose = F)
+markers4 <- FindAllMarkers(object = se_split[[4]], logfc.threshold = 0.5, return.thresh = 0.01, 
+                           only.pos = T, verbose = F)
+markers5 <- FindAllMarkers(object = se_split[[5]], logfc.threshold = 0.5, return.thresh = 0.01, 
+                           only.pos = T, verbose = F)
+markers6 <- FindAllMarkers(object = se_split[[6]], logfc.threshold = 0.5, return.thresh = 0.01, 
+                           only.pos = T, verbose = F)
+```
+
+
+
+## Calculate the Jaccard indices
+```{r}
+all.markers <- list(markers1, markers2, markers3, markers4, markers5, markers6)
+names(all.markers) <- c("A", "B", "C", "D", "E", "F")
+```
+
+Now for each patient’s clusters we want to know which genes overlap with every other cluster in every other patient, store that in datalist. Also store a dataframe with all jaccard indices, store that in jaccard_total
+
+```{r}
+datalist <- c()
+jaccard_total = data.frame()
+
+for (i in 1:length(all.markers)){ # iterate over each patient data
+  cluster <- unique(all.markers[[i]]$cluster) 
+  ref <- names(all.markers[i])
+  rest <- names(all.markers) #!= ref
+  rest_data <- all.markers[rest] # get the "query" data
+  for (cl in cluster){ # iterate over each cluster in the reference data
+    reference_cl <- subset(all.markers[[i]], cluster==cl)
+    for (j in 1:length(rest_data)){ # iterate over each the query data 
+      query_clusters <- unique(rest_data[[j]]$cluster)
+      query_name<- names(rest_data[j])
+      for (q_cl in query_clusters){ # iterate over each cluster in the reference data
+        query_cl <- subset(rest_data[[j]], cluster==q_cl)
+        bool_ref <- reference_cl$gene %in% query_cl$gene
+        bool_query <- query_cl$gene %in% reference_cl$gene
+        overlap_ref <- which(bool_ref)
+        overlap_query <- which(bool_query)
+        genes <- reference_cl$gene[overlap_ref]
+        pvals_ref <- reference_cl$p_val[overlap_ref]
+        log2FC_ref <- reference_cl$avg_log2FC[overlap_ref]
+        pvals_query <- query_cl$p_val[overlap_query]
+        log2FC_query <- query_cl$avg_log2FC[overlap_query]
+        df <- data.frame(gene=genes, adj_pval_ref = pvals_ref, avg_log2FC_ref = log2FC_ref,
+                         adj_pval_query = pvals_query, avg_log2FC_query = log2FC_query)
+        df <- mutate(df, patient_ref= paste0(ref,cl), patient_query=paste0(query_name, q_cl))
+        data_ls <- list(df)
+        datalist <- c(datalist, data_ls)
+        
+        # get jaccard indexes
+        jaccard_index = length(overlap_ref) / length(unique(c(reference_cl$gene, query_cl$gene)))
+        j_df <- data.frame(jaccard=jaccard_index, patient_ref= paste0(ref,cl), patient_query=paste0(query_name, q_cl))
+        jaccard_total <- rbind(jaccard_total,j_df)
+      }
+    }
+}
+}
+big_data <- dplyr::bind_rows(datalist)
+```
+
+
+## Cluster the jaccard indices
+
+```{r}
+Vector2<-matrix(jaccard_total$jaccard,nrow=43,byrow=TRUE)
+colnames(Vector2) <- unique(jaccard_total$patient_ref)
+
+#Make the 1 values (representing identical clusters compared to each other) as NA
+Vector2[Vector2==1] <- NA
+```
+
+Annotate the rows based on single cell labels
+```{r}
+v <- c("A0: iCAFs/Plasma cells", "A1: Myoepithelial", "A2: Epithelial luminal mature", "A3: Epithelial-Basal", "A4: myCAFs", "A5: Plasma cells", "A6: Epithelial-Basal", 
+       "B0: Myeloid/B-cells", "B1: Plasma cells/Epithelial-Basal", "B2: Endothelial/dPVL/Unassigned T-cells",
+       "B3: Myoepithelial/CD4+T-cells/T-regs", "B4: Epithelial-Basal", "B5: iCAFs/Plasma cells/CD8+ T-cells", "B6: Epithelial-Basal/myCAFs", "C0: Epithelial-Basal/Plasma cells", "C1: Epithelial-Basal", "C2: Plasma cells", "C3: dPVL/imPVL/Myoepithelial","C4: Epithelial-Basal/myCAFs", "C5: B-cells/Myeloid/CD4+ T-cells-/T-regs", "C6: Epithelial-Basal", "D0: iCAFs/myCAFs", "D1: Epithelial-Basal", "D2: Epithelial-Basal", "D3: Plasma cells/B-cells/Epithelial-Basal", "D4: Myoepithelial", "D5: Epithelial-Basal", "D6: Myoepithelial/Endothelial cells", "D7: myCAFs", "E0: Endothelial cells/dPVL/imPVL", "E1: Epithelial-Basal", "E2: Epithelial-Basal", "E3: Epithelial-Basal/Epithelial-Basal-Cycling", "E4: Plasma cells/myCAFs/imPVL", "E5: Myoepitelial/Epithelial-Basal", "E6: Myeloid/myCAFs", "E7: Endothelial/Myoepithelial", "F0: iCAFs/Plasma cells", "F1: Endothelial/Myeloid/Plasma cells", "F2: Epithelial-Basal/Endothelial/CD8+ T-cells", "F3: Epithelial-Basal", "F4: Epithelial-Basal/Epithelial-Luminal Mature", "F5: myCAFs/imPVL")
+
+row.names(Vector2) <- v
+```
+
+
+Make a distance matrix and dendrogram used to group the clusters
+```{r}
+distMat <- dist(Vector2, method = "euclidean")
+tree <- hclust(d = distMat, method = "complete")
+clusters <- cutree(tree, k = 7)
+
+ann <- data.frame(clusters = factor(clusters), row.names = names(clusters))
+ann <- ann[tree$order,  ,drop = FALSE]
+```
+
+
+```{r}
+ann
+```
+
+
+```{r, fig.width=12, fig.height=7}
+pheatmap(Vector2, show_colnames =T, show_rownames = T, border_color = FALSE, annotation_col = ann,color = colorRampPalette(rev(brewer.pal(n = 11, name ="Spectral")))(100))
+```
+
+
+## Pre-processing pathway enrichment
+
+Pick all genes used to compute the jaccard indices. Here all genes from each cluster will be arranged based on descending log2 fold change
+```{r}
+pathway_genes <- function (marker_df){
+  df_clusters <- c()
+  for (i in unique(marker_df$cluster)){
+    m <- subset(marker_df, cluster==i)
+    m <- arrange(m, desc(avg_log2FC))
+    up_genes <- m$gene
+    df_list <- list(up_genes)
+    df_clusters <- c(df_clusters, df_list)
+  }
+  return(df_clusters)
+}
+```
+
+
+```{r}
+m1_genes <- pathway_genes(markers1)
+m2_genes <- pathway_genes(markers2)
+m3_genes <- pathway_genes(markers3)
+m4_genes <- pathway_genes(markers4)
+m5_genes <- pathway_genes(markers5)
+m6_genes <- pathway_genes(markers6)
+```
+
+
+
+## Pathway analysis
+
+
+Function to perform ORA with gprofiler 2 using GO:BP as source and retrieve the top 3 enriched pathways for that cluster (given there are three below a threshold of 0.01)
+
+```{r}
+library(gprofiler2)
+is.not.null <- function(x) !is.null(x)
+bp_enrichment_top3 <- function(cluster_genes, marker_df) {
+  df <- data.frame()
+  cluster_number <- unique(marker_df$cluster)
+ for (i in 1:length(cluster_genes)){
+  enrichment <- gost(query = cluster_genes[[i]], ordered_query = TRUE, organism = 'hsapiens', correction_method = 'fdr', user_threshold = 0.05, source="GO:BP") 
+  if (is.not.null(enrichment$result)){
+  enrichment$result <- mutate(enrichment$result, cluster = cluster_number[i]) 
+df <- rbind(df, enrichment$result[,c("term_name", "p_value", "cluster")][1:3,])
+}
+}
+log10_pvalue <- -log10(unlist(df$p_value))
+df <- cbind(df, log10_pvalue)
+df$term_name <- toupper(df$term_name)
+return (df)
+}
+```
+
+Function to plot the enriched pathways.
+
+```{r}
+bp_plot <- function(data){
+  plt <- ggplot(data, aes(x = cluster, y = term_name)) +
+        geom_point(aes(color=term_name, size=log10_pvalue)) + 
+        theme_classic()+
+  theme(legend.position="right", axis.text  = element_text(size=12), axis.title.x = element_text(size=12), axis.title.y = element_blank(), legend.text = element_text(size=12),
+        legend.title = element_text(size = 12)) +
+  xlab(label = "Clusters")+
+  guides(color = FALSE, size=guide_legend("-log10 (FDR p-value)"))
+return(plt)
+}
+```
+
+```{r}
+m1_bp <- bp_enrichment_top3(m1_genes, markers1)
+
+m2_bp <- bp_enrichment_top3(m2_genes, markers2)
+
+m3_bp <- bp_enrichment_top3(m3_genes, markers3)
+
+m4_bp <- bp_enrichment_top3(m4_genes, markers4)
+
+m5_bp <- bp_enrichment_top3(m5_genes, markers5)
+
+m6_bp <- bp_enrichment_top3(m6_genes, markers6)
+```
+
+
+## Hallmarks enrichment
+
+```{r, eval=FALSE}
+gprofiler2::upload_GMT_file("/home/ivar.karam/presentation//h.all.v7.2.symbols.gmt")
+```
+
+Take the same function and alter it so that the organism is specified with the retrieved organism ID generated from uploading the hallmarks GMT file to gprofiler
+```{r}
+hallmarks_enrichment <- function(cluster_genes, marker_df) {
+  df <- data.frame()
+  cluster_number <- unique(marker_df$cluster)
+ for (i in 1:length(cluster_genes)){
+  enrichment <- gost(query = cluster_genes[[i]], ordered_query = TRUE, organism = 'gp__H5Ou_GQmg_g1w', correction_method = 'fdr', user_threshold = 0.05) 
+  if (is.not.null(enrichment$result)){
+  enrichment$result <- mutate(enrichment$result, cluster = cluster_number[i]) 
+df <- rbind(df, enrichment$result[,c("p_value", "cluster", "term_id")])
+}
+}
+log10_pvalue <- -log10(unlist(df$p_value))
+df <- cbind(df, log10_pvalue)
+df$term_id <- gsub(pattern = "_", replacement = " ", x = df$term_id)
+df <- df %>% rename(term_name = term_id)
+return (df)
+}
+```
+
+
+```{r, message=FALSE}
+m1_hallmarks <- hallmarks_enrichment(m1_genes, markers1)
+m2_hallmarks <- hallmarks_enrichment(m2_genes, markers2)
+m3_hallmarks <- hallmarks_enrichment(m3_genes, markers3)
+m4_hallmarks <- hallmarks_enrichment(m4_genes, markers4)
+m5_hallmarks <- hallmarks_enrichment(m5_genes, markers5)
+m6_hallmarks <- hallmarks_enrichment(m6_genes, markers6)
+```
+
+
+```{r, fig.width=18, fig.height=11}
+pathway_A <- dplyr::bind_rows(m1_bp, m1_hallmarks)
+pathway_B <- dplyr::bind_rows(m2_bp, m2_hallmarks)
+pathway_C <- dplyr::bind_rows(m3_bp, m3_hallmarks)
+pathway_D <- dplyr::bind_rows(m4_bp, m4_hallmarks)
+pathway_E <- dplyr::bind_rows(m5_bp, m5_hallmarks)
+pathway_F <- dplyr::bind_rows(m6_bp, m6_hallmarks)
+
+bp_plot(pathway_A)
+bp_plot(pathway_B)
+bp_plot(pathway_C)
+bp_plot(pathway_D)
+bp_plot(pathway_E)
+bp_plot(pathway_F)
+```
+
+
+Look at which cluster are enriched for EMT and what their significance is
+```{r}
+emt <- data.frame()
+all_pathways <- list(pathway_A, pathway_B, pathway_C, pathway_D, pathway_E, pathway_F)
+for (i in 1:length(all_pathways)){
+  patients <- c("A", "B","C", "D", "E","F")
+  data<-subset(all_pathways[[i]], term_name=="HALLMARK EPITHELIAL MESENCHYMAL TRANSITION")
+  data <- data %>% mutate(patient=patients[i])
+  emt <- rbind(emt, data)
+}
+arrange(emt, desc(log10_pvalue))
+```
+
+
+Now annotate the clusters based on enriched pathways
+
+ALL unknown are NOT clearly annotated with either GO:BP or HALLMARKS
+
+To try and remove noise only clusters with a -log10 adjusted p-value equal to or above 5 is referred to as EMT
+```{r}
+v <- c("A0: Immune: B-cell/Adipogenesis", "A1: Estrogen response/Respiration", "A2: Glycolysis/Hypoxia", "A3: Growth factor response", "A4: Apoptosis/EMT", "A5: EMT/Interferon", "A6: Unclear", "B0: Interferon", "B1: EMT/Coagulation", "B2: Sterol import", "B3: Immune: Leukocytes", "B4: Secretion", "B5: Unclear", "B6: Neutrophil activation", "C0: Cell adhesion", "C1: Cell adhesion", "C2: Immune: B-cell", "C3: Immune response", "C4: EMT/Apoptosis/Interferon", "C5: Immune: Leukocytes", "C6: Unclear", "D0: EMT", "D1: Keratinization", "D2: Respiration", "D3: Immune: Leukocytes", "D4: Innate immune", "D5: Immune: APC/Cytokine", "D6: EMT/Estrogen response", "D7: EMT/Adipogenesis", "E0: EMT/Defense response", "E1: Respiration", "E2: Hypoxia/EMT", "E3: Splicing", "E4: EMT/Immune response", "E5: Immune: APC/Interferon", "E6: EMT/Immune response", "E7: Immune response" , "F0: EMT/Immune response", "F1: Innate immune/Interferon", "F2: Interferon", "F3: Neutrophil activation", "F4: Lipid metabolism/Estrogen response", "F5: Adipogenesis/Hormone response")
+```
+
+
+```{r, fig.width=12, fig.height=7}
+row.names(Vector2) <- v
+pheatmap(Vector2, show_colnames =T, show_rownames = T, border_color = FALSE, annotation_col = ann, color = colorRampPalette(rev(brewer.pal(n = 11, name ="Spectral")))(100))
+```
+
+
+## Find overlapping signatures
+
+We can then look for overlapping genes between clusters in our groups. This code (as with previous codes) might not be the most aesthetically pleasing, however it does it job (thankfully). Briefly, given an input of clusters and a data frame containing meta data of genes overlapping between clusters (the “big_data” object during jaccard calculations) it checks the overlap between two clusters at the time stores that in a list. Lastly, the code will check for genes that are common in all of those list.
+
+
+```{r}
+find_overlap <- function (clusters, gene_data){
+  genes <- c()
+  for (i in clusters){
+  temp_data <- which(clusters != i)
+  temp_data <- clusters[temp_data]
+  for (j in temp_data){
+    gene <- subset(gene_data, patient_ref==i & patient_query==j)$gene
+    data <- list(gene)
+    genes <- c(genes, data)
+  }
+  }
+  overlap <- Reduce(intersect, genes)
+  return(overlap)
+}
+```
+
+
+
+```{r}
+cluster1 <- find_overlap(c("A0", "D7", "F5"), big_data) # adipogenesis related, 3 patients
+length(cluster1)
+cluster2 <- find_overlap(c("A1", "A3", "E1", "E3", "F4", "C1", "C6", "B4", "C0"), big_data) # no genes
+length(cluster2)
+cluster3 <- find_overlap(c("A2", "A4", "F1", "F2", "D1", "D5", "D2", "F3", "B6", "E2"), big_data)
+length(cluster3)
+cluster4 <- find_overlap(c("C4", "C5", "C3", "A5", "E6"), big_data) # T-cell enriched cancer, 23 genes, 5 cluster 3 patients
+length(cluster4)
+cluster5 <- find_overlap(c("D3", "B3", "E4", "B1", "C2", "B2", "B5", "A6", "B0"), big_data)  # no overlap
+length(cluster5)
+cluster6 <- find_overlap(c("F0", "D0", "E0"), big_data) # B-cell enriched tumour 3 patients
+length(cluster6)
+cluster7 <- find_overlap(c("E7", "D4", "D6"), big_data) # 2 patients only 
+length(cluster7)
+
+all_immune <- find_overlap(c("E7", "D4", "D6", "F0", "D0", "E0", "C4", "C5", "C3", "A5", "E6"), big_data)
+all_immune
+```
+
+
+## Cluster 1-Adipogenesis
+-Includes A0, D7, F5
+```{r}
+cluster1
+```
+
+lncRNA Related: CDR1-AS
+
+Complement genes: CFD,
+
+Fatty acid related genes: FABP4, adiponectin (ADIPOQ), adipogenesis regulatory factor (ADIRF), PLIN1 + PLIN4 (perilipin-1/4), LIPE (hormone sensitive lipase), LRP1 (LDL Receptor Related Protein 1), RARRES2
+
+Fatty acid metabolism: GPD1, G0S2
+
+Cancer: MALAT1
+
+small non coding RNA: RNU4ATAC
+
+
+## Cluster 4-T-cell enriched regions
+includes "C4", "C5", "C3", "A5", "E6" of which C4, A5 and E6 are annotated as EMT and C5 and C3 annotated as 
+```{r}
+cluster4
+```
+
+Antigen presenting: HLA-A, HLA-DMB, HLA-E, HLA-DPB1
+
+Macrophage marker: CD52
+
+Interferon-related: XAF1
+
+Complement: C3 
+
+Cytokine: CCL5 
+
+T-cell associated: TRBC1(T Cell Receptor Beta Constant 1), TRAC (T Cell Receptor Alpha Constant)
+
+
+## Cluster 6 - B-cell enriched
+
+```{r}
+cluster6
+```
+
+
+B-cell enriched, all related with cancer “D0”, “E0”, “F0”
+
+B-cell marker: IGHA1 (Immunoglobulin Heavy Constant Alpha 1), IGKC (Immunoglobulin Kappa Constant), , IGHG1 (Immunoglobulin Heavy Constant Gamma 1, IGHG2
+
+Cancer: MALAT1, emt-related: “BGN” “COL6A2” “TAGLN” “NNMT” “IGFBP4” “MYL9” “PCOLCE” “FBLN1” “TPM2” “THY1”
+
+complement: C1R
+
+
+## Check if T-cells in any of the B-cell enriched cluster and vice versa
+
+HLA-A, HLA-DMB, HLA-E, HLA-DPB1
+
+Macrophage marker: CD52
+
+Here I have also added TRBC2 to see if this gene cou 
+```{r}
+markers_cluster4 <- c("TRAC", "TRBC1", "HLA-A","CD52", "HLA-E", "HLA-DMB", "HLA-DPB1") 
+e0_e6<- find_overlap(c("E0", "E6"), big_data)
+markers_cluster4 %in% e0_e6
+```
+
+So E6 contains B-cell markers but E0 does not contain T-cell markers (both are annotated as EMT), thus we can infer inter patient tumor heterogeneity based on immune infiltration
+
+
+```{r}
+f0_e6<- find_overlap(c("F0", "E6"), big_data)
+markers_cluster4 %in% f0_e6
+```
+
+```{r}
+d0_e6 <- find_overlap(c("D0", "E6"), big_data)
+markers_cluster4 %in% d0_e6
+```
+
+None of the clusters contain T cell markers
+
+
+Check for B-cell markers in group4
+
+```{r}
+b_cell_markers <- c("IGHA1", "IGKC", "IGHG1", "IGHG1")
+e0_e6<- find_overlap(c("E0", "E6"), big_data)
+b_cell_markers %in% e0_e6
+```
+E6 contains B-cell markers
+
+
+```{r}
+e0_c4<- find_overlap(c("E0", "C4"), big_data)
+b_cell_markers %in% e0_c4
+```
+
+
+```{r}
+e0_c5<- find_overlap(c("E0", "C5"), big_data)
+b_cell_markers %in% e0_c5
+```
+
+```{r}
+e0_c3<- find_overlap(c("E0", "C3"), big_data)
+b_cell_markers %in% e0_c3
+```
+
+```{r}
+e0_a5<- find_overlap(c("E0", "A5"), big_data)
+b_cell_markers %in% e0_a5
+```
+
+Only E6 contains B-cell markers in group 6
+
+
+
